@@ -44,3 +44,15 @@ jobs:
         with:
           name: native-distro-evidence
           path: audit/evidence/matrix/
+
+  flatpak-bridge-shutdown:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak bridge runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes flatpak python3-gi gir1.2-flatpak-1.0
+      - name: Repeat real bridge calls and check clean shutdown
+        run: python3 scripts/test-flatpak-bridge-shutdown.py

@@ -7,8 +7,11 @@ Each request is a single bounded JSON document; stdout contains JSON events.
 """
 import hashlib
 import json
+import os
 import re
+import select
 import sys
+import threading
 import gi
 
 gi.require_version("Flatpak", "1.0")
@@ -267,6 +270,53 @@ def handle(installation, request, cancellable=None):
     raise ValueError("unsupported bridge operation")
 
 
+def read_request(fd, limit=1048576):
+    """Read one bounded JSON line without BufferedReader read-ahead/locking."""
+    data = bytearray()
+    while True:
+        chunk = os.read(fd, min(65536, limit + 2 - len(data)))
+        if not chunk:
+            if data:
+                if len(data) > limit:
+                    raise ValueError("request exceeds bound")
+                return bytes(data), b""
+            raise ValueError("incomplete request")
+        data.extend(chunk)
+        newline = data.find(b"\n")
+        if newline >= 0:
+            if newline > limit:
+                raise ValueError("request exceeds bound")
+            return bytes(data[:newline]), bytes(data[newline + 1:])
+        if len(data) > limit:
+            raise ValueError("request exceeds bound")
+
+
+def watch_cancellation(fd, pending, cancellable, stop):
+    """Watch the same unbuffered descriptor and exit promptly when stopped."""
+    data = bytearray(pending)
+    while not stop.is_set():
+        newline = data.find(b"\n")
+        if newline >= 0:
+            control = bytes(data[:newline]).strip()
+            del data[:newline + 1]
+            if control == b"cancel":
+                cancellable.cancel()
+                return
+            # Only the fixed cancel command is part of the control protocol.
+            if len(data) > 16:
+                return
+            continue
+        if len(data) > 16:
+            return
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if not readable:
+            continue
+        chunk = os.read(fd, 16 - len(data) if data else 16)
+        if not chunk:
+            return
+        data.extend(chunk)
+
+
 def main():
     if sys.argv[1:]:
         if len(sys.argv) != 3 or sys.argv[1] != "--test-installation":
@@ -274,16 +324,20 @@ def main():
         installation = Flatpak.Installation.new_for_path(Gio.File.new_for_path(sys.argv[2]), True, None)
     else:
         installation = Flatpak.Installation.new_system(None)
-    raw = sys.stdin.buffer.readline(1048577)
-    if len(raw) > 1048576:
-        raise ValueError("request exceeds bound")
-    import threading
+    raw, pending = read_request(sys.stdin.fileno())
     cancellable = Gio.Cancellable.new()
-    def controls():
-        if sys.stdin.buffer.readline(16).strip() == b"cancel":
-            cancellable.cancel()
-    threading.Thread(target=controls, daemon=True).start()
-    emit("result", value=handle(installation, json.loads(raw), cancellable))
+    stop = threading.Event()
+    controls = threading.Thread(
+        target=watch_cancellation,
+        args=(sys.stdin.fileno(), pending, cancellable, stop),
+        name="archon-flatpak-cancel-listener",
+    )
+    controls.start()
+    try:
+        emit("result", value=handle(installation, json.loads(raw), cancellable))
+    finally:
+        stop.set()
+        controls.join()
 
 if __name__ == "__main__":
     try:
